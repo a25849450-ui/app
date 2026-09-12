@@ -1,0 +1,173 @@
+name: LettuceAI Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: r26d
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust-build
+        with:
+          cache-key: android-termux
+          cache-targets: false
+          target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: gradle
+
+      - name: Setup Android
+        uses: android-actions/setup-android@v3
+
+      - name: Setup NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          link-to-sdk: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev perl
+
+      - name: Install JavaScript dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Apply Android overrides
+        run: node scripts/apply-android-overrides.mjs
+
+      - name: Download official eSpeak bundle
+        run: |
+          set -euo pipefail
+
+          . .github/espeak-android-bundle.env
+
+          DEST="$RUNNER_TEMP/$BUNDLE_ASSET"
+
+          gh release download "$BUNDLE_TAG" \
+            --repo LettuceAI/app \
+            --pattern "$BUNDLE_ASSET" \
+            --output "$DEST" \
+            --clobber
+
+          sha256sum "$DEST"
+
+          ACTUAL="$(sha256sum "$DEST" | awk '{print $1}')"
+
+          if [ "$ACTUAL" != "$BUNDLE_SHA256" ]; then
+            echo "eSpeak bundle SHA256 mismatch"
+            exit 1
+          fi
+
+          echo "KOKORO_ESPEAK_ANDROID_BUNDLE_PATH=$DEST" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RUST_BACKTRACE: "1"
+        run: |
+          bun run tauri android build --ci --apk
+
+      - name: Find APK
+        run: |
+          set -euo pipefail
+
+          APK="$(
+            find src-tauri/gen/android/app/build/outputs/apk \
+              -type f \
+              -name "*.apk" |
+            head -n 1
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "APK not found"
+            exit 1
+          fi
+
+          echo "APK=$APK" >> "$GITHUB_ENV"
+
+      - name: Generate temporary signing key
+        run: |
+          set -euo pipefail
+
+          STORE="$RUNNER_TEMP/lettuceai.jks"
+          PASS="$(openssl rand -hex 32)"
+
+          keytool -genkeypair \
+            -keystore "$STORE" \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -alias lettuceai \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=LettuceAI"
+
+          echo "KEYSTORE=$STORE" >> "$GITHUB_ENV"
+          echo "KEYPASS=$PASS" >> "$GITHUB_ENV"
+
+      - name: Sign APK
+        run: |
+          set -euo pipefail
+
+          BT="$ANDROID_SDK_ROOT/build-tools/$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -n 1)"
+          ZIPALIGN="$BT/zipalign"
+          APKSIGNER="$BT/apksigner"
+
+          ALIGNED="$RUNNER_TEMP/aligned.apk"
+          FINAL="$RUNNER_TEMP/lettuceai-android-universal.apk"
+
+          "$ZIPALIGN" -f 4 "$APK" "$ALIGNED"
+
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-pass "pass:$KEYPASS" \
+            --key-pass "pass:$KEYPASS" \
+            --ks-key-alias lettuceai \
+            --out "$FINAL" \
+            "$ALIGNED"
+
+          "$APKSIGNER" verify --verbose "$FINAL"
+
+          mkdir -p dist-artifacts
+          cp "$FINAL" dist-artifacts/lettuceai-android-universal.apk
+          sha256sum dist-artifacts/lettuceai-android-universal.apk \
+            > dist-artifacts/lettuceai-android-universal.apk.sha256
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist-artifacts/*
+          if-no-files-found: error
+          retention-days: 7
