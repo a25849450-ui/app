@@ -1,0 +1,268 @@
+name: LettuceAI Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  NDK_VERSION: r26d
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "latest"
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust-build
+        with:
+          cache-key: android-termux
+          cache-targets: false
+          target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: gradle
+          cache-dependency-path: |
+            src-tauri/gen/android/**/*.gradle*
+            src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          link-to-sdk: true
+
+      - name: Free runner disk space
+        run: |
+          set -e
+
+          sudo rm -rf /usr/local/lib/android/sdk/system-images || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo docker system prune -af || true
+
+      - name: Install build dependencies
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            perl
+
+      - name: Provide Android AR/RANLIB shims
+        run: |
+          set -e
+
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          TRIPLES=(
+            aarch64-linux-android
+            armv7-linux-androideabi
+            arm-linux-androideabi
+            i686-linux-android
+            x86_64-linux-android
+          )
+
+          for triple in "${TRIPLES[@]}"; do
+            sudo ln -sf \
+              "$TOOLCHAIN/llvm-ar" \
+              "/usr/local/bin/${triple}-ar"
+
+            sudo ln -sf \
+              "$TOOLCHAIN/llvm-ranlib" \
+              "/usr/local/bin/${triple}-ranlib"
+          done
+
+      - name: Install JavaScript dependencies
+        run: |
+          bun install --frozen-lockfile
+
+      - name: Apply Android overrides
+        run: |
+          node scripts/apply-android-overrides.mjs
+
+      - name: Fetch official eSpeak NG Android bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PIN_FILE=".github/espeak-android-bundle.env"
+
+          if [ ! -f "$PIN_FILE" ]; then
+            echo "Missing $PIN_FILE"
+            exit 1
+          fi
+
+          . "$PIN_FILE"
+
+          : "${BUNDLE_TAG:?Missing BUNDLE_TAG}"
+          : "${BUNDLE_ASSET:?Missing BUNDLE_ASSET}"
+          : "${BUNDLE_SHA256:?Missing BUNDLE_SHA256}"
+
+          DEST="$RUNNER_TEMP/$BUNDLE_ASSET"
+
+          gh release download "$BUNDLE_TAG" \
+            --repo LettuceAI/app \
+            --pattern "$BUNDLE_ASSET" \
+            --output "$DEST" \
+            --clobber
+
+          ACTUAL="$(sha256sum "$DEST" | awk '{print $1}')"
+
+          echo "Expected: $BUNDLE_SHA256"
+          echo "Actual:   $ACTUAL"
+
+          if [ "$ACTUAL" != "$BUNDLE_SHA256" ]; then
+            echo "eSpeak bundle SHA256 mismatch."
+            exit 1
+          fi
+
+          echo "KOKORO_ESPEAK_ANDROID_BUNDLE_PATH=$DEST" \
+            >> "$GITHUB_ENV"
+
+      - name: Build Tauri Android APK
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RUST_BACKTRACE: "1"
+        run: |
+          set -euo pipefail
+
+          bun run tauri android build --ci --apk
+
+      - name: Locate universal release APK
+        run: |
+          set -euo pipefail
+
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk/universal/release"
+
+          SIGNED="$APK_DIR/app-universal-release.apk"
+          UNSIGNED="$APK_DIR/app-universal-release-unsigned.apk"
+
+          if [ -f "$SIGNED" ]; then
+            echo "APK=$SIGNED" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ -f "$UNSIGNED" ]; then
+            echo "APK=$UNSIGNED" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "Universal release APK was not found."
+          find "src-tauri/gen/android/app/build/outputs/apk" \
+            -type f \
+            -name "*.apk" \
+            -print
+
+          exit 1
+
+      - name: Generate temporary signing key
+        run: |
+          set -euo pipefail
+
+          STORE="$RUNNER_TEMP/lettuceai-termux.jks"
+          PASS="$(openssl rand -hex 32)"
+
+          keytool \
+            -genkeypair \
+            -keystore "$STORE" \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -alias lettuceai \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=LettuceAI Android Build"
+
+          echo "KEYSTORE=$STORE" >> "$GITHUB_ENV"
+          echo "KEYPASS=$PASS" >> "$GITHUB_ENV"
+
+      - name: Sign and verify universal APK
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          set -euo pipefail
+
+          BUILD_TOOLS="$(
+            ls "$ANDROID_SDK_ROOT/build-tools" |
+            sort -V |
+            tail -n 1
+          )"
+
+          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS/zipalign"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS/apksigner"
+
+          if [[ "$APK" == *"-unsigned.apk" ]]; then
+            ALIGNED="$RUNNER_TEMP/aligned.apk"
+            SIGNED="$RUNNER_TEMP/lettuceai-android-universal.apk"
+
+            "$ZIPALIGN" -f 4 \
+              "$APK" \
+              "$ALIGNED"
+
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE" \
+              --ks-pass "pass:$KEYPASS" \
+              --key-pass "pass:$KEYPASS" \
+              --ks-key-alias lettuceai \
+              --out "$SIGNED" \
+              "$ALIGNED"
+
+            APK="$SIGNED"
+          fi
+
+          "$APKSIGNER" verify \
+            --verbose \
+            "$APK"
+
+          mkdir -p dist-artifacts
+
+          cp "$APK" \
+            dist-artifacts/lettuceai-android-universal.apk
+
+          sha256sum \
+            dist-artifacts/lettuceai-android-universal.apk \
+            > dist-artifacts/lettuceai-android-universal.apk.sha256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: |
+            dist-artifacts/lettuceai-android-universal.apk
+            dist-artifacts/lettuceai-android-universal.apk.sha256
+          if-no-files-found: error
+          retention-days: 7
