@@ -33,17 +33,35 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            val keystorePropertiesFile = rootProject.file("keystore.properties")
-            val keystoreProperties = Properties()
-            if (keystorePropertiesFile.exists()) {
-                keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-            }
+        // CI_SIGNING_OPTIONAL
 
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["password"] as String
-            storeFile = file(keystoreProperties["storeFile"] as String)
-            storePassword = keystoreProperties["password"] as String
+        create("release") {
+            val keystorePropertiesFile =
+                rootProject.file("keystore.properties")
+
+            if (keystorePropertiesFile.exists()) {
+                val keystoreProperties = Properties()
+
+                keystorePropertiesFile.inputStream().use {
+                    keystoreProperties.load(it)
+                }
+
+                keyAlias =
+                    keystoreProperties.getProperty("keyAlias")
+
+                keyPassword =
+                    keystoreProperties.getProperty("password")
+
+                val storeFilePath =
+                    keystoreProperties.getProperty("storeFile")
+
+                if (!storeFilePath.isNullOrBlank()) {
+                    storeFile = file(storeFilePath)
+                }
+
+                storePassword =
+                    keystoreProperties.getProperty("password")
+            }
         }
     }
 
@@ -56,7 +74,10 @@ android {
         }
         getByName("release") {
             isMinifyEnabled = true
-            signingConfig = signingConfigs.getByName("release")
+
+            if (rootProject.file("keystore.properties").exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
