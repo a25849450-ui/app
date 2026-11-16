@@ -34,3 +34,20 @@ jobs:
 
       - name: TypeScript and production frontend build
         run: bun run build
+
+  android-sdk-smoke:
+    name: android-sdk-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Verify platform-tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          adb version
+          sdkmanager --list_installed | grep -E 'platform-tools'
