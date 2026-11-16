@@ -75,3 +75,15 @@ This repository values changes that are easy to review, consistent with the exis
 
 - Consider desktop and mobile impact when changing shared behavior.
 - Separate platform-specific fixes from feature work unless they are strictly required.
+
+
+## Pull Request checks
+
+Every pull request targeting `main` runs `.github/workflows/ci.yml`. Before requesting review, run:
+
+```sh
+bun install --frozen-lockfile
+bun run build
+```
+
+The CI job repeats the locked dependency installation and production frontend build. The `build` script runs TypeScript compilation and Vite production bundling. This check does not replace native Tauri/Rust packaging or platform-specific Android/iOS release builds. Do not merge until the PR diff has been reviewed and the `frontend-build` check has passed.
